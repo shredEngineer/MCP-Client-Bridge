@@ -9,7 +9,6 @@ dependencies = [
   "mcp",
 ]
 
-# Expose a CLI: `mcp-client-bridge`
 [project.scripts]
 mcp-client-bridge = "mcp_client_bridge.__main__:main"
 
