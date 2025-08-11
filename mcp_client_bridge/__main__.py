@@ -2,13 +2,15 @@
 #  This file is part of Archive Agent. See LICENSE for details.
 
 import asyncio
-import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional, Dict, Any, List, Union
+
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+
+from rich import print_json
 
 
 server_url = "http://192.168.178.39:8008/sse"
@@ -21,19 +23,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _maybe_json(text: str) -> Union[Dict[str, Any], List[Any], str]:
-    """
-    Try to parse JSON text; if parsing fails, return the original string.
-
-    :param text: Input string.
-    :return: Parsed JSON object, or original string if not JSON.
-    """
-    try:
-        return json.loads(text)
-    except Exception:
-        return text
-
-
 class McpClient:
     """
     MCP client.
@@ -44,96 +33,84 @@ class McpClient:
         Initialize MCP client.
         """
         self.session: Optional[ClientSession] = None
-        self._session_context: Optional[ClientSession] = None  # context manager proxy, not the logical session
-        self._streams_context = None  # sse_client() async context manager
+        self.exit_stack = AsyncExitStack()
+        self._session_context = None
+        self._streams_context = None
 
     async def connect_to_sse_server(self) -> None:
         """
         Connect to MCP server running with SSE transport.
-
-        Raises
-        ------
-        RuntimeError
-            If the connection or initialization fails.
         """
         self._streams_context = sse_client(url=server_url)
         streams = await self._streams_context.__aenter__()
 
         self._session_context = ClientSession(*streams)
         self.session = await self._session_context.__aenter__()
+
         await self.session.initialize()
 
         # List available tools to verify connection
+        logger.info("Initialized SSE client...")
+        logger.info("Listing tools...")
         response = await self.session.list_tools()
         tools = response.tools
-        logger.info("Initialized SSE client. Tools: %s", [tool.name for tool in tools])
+        logger.info("Connected to server with tools: %s", [tool.name for tool in tools])
 
     async def cleanup(self) -> None:
         """
         Clean up the session and streams.
         """
-        try:
-            if self._session_context is not None:
-                await self._session_context.__aexit__(None, None, None)
-        finally:
-            if self._streams_context is not None:
-                await self._streams_context.__aexit__(None, None, None)
+        if self._session_context:
+            await self._session_context.__aexit__(None, None, None)
+        if self._streams_context:
+            await self._streams_context.__aexit__(None, None, None)
 
-    async def _call_tool_json(self, name: str, arguments: Dict[str, Any]) -> Any:
+    @staticmethod
+    def _as_json_dict(payload: Any) -> Dict[str, Any]:
         """
-        Call an MCP tool and return a best-effort decoded JSON payload.
+        Convert a tool call result into a JSON-like dict.
 
-        The MCP spec transports rich content as a list. We accept:
-        - a direct JSON object (some servers serialize dicts directly),
-        - a single text part containing JSON,
-        - otherwise we return the raw content structure.
-
-        Parameters
-        ----------
-        name:
-            Tool name, e.g. "get_search_result".
-        arguments:
-            JSON-serializable dict of arguments.
-
-        Returns
-        -------
-        Any
-            Decoded JSON (dict/list) or raw content.
+        Notes
+        -----
+        We try a few common MCP content shapes to keep this resilient:
+        - If the payload is already a dict, return it.
+        - If it has ``content`` items with ``.json`` fields, use the first one.
+        - If it has text that looks like JSON, attempt to parse it.
         """
-        assert self.session is not None
-        resp = await self.session.call_tool(name=name, arguments=arguments)
+        if isinstance(payload, dict):
+            return payload
 
-        # Common patterns:
-        # 1) resp.content is a list of parts; each part may have `.text`
-        # 2) some implementations put the object directly into `.content[0].text` (JSON)
-        # 3) some return already structured content
-        content = getattr(resp, "content", None)
+        # Tool results from mcp can have a `.content` list with parts.
+        content: Optional[List[Any]] = getattr(payload, "content", None)
+        if content:
+            part0 = content[0]
+            # Prefer structured JSON if present
+            json_data = getattr(part0, "json", None)
+            if isinstance(json_data, dict):
+                return json_data  # type: ignore[return-value]
 
-        if isinstance(content, list) and content:
-            part = content[0]
-            text = getattr(part, "text", None)
-            if isinstance(text, str):
-                return _maybe_json(text)
-            # Some SDKs place the dict under `.data` or similar; try common attributes:
-            data = getattr(part, "data", None)
-            if data is not None:
-                return data
-            return content
+            # Fall back to text that may contain JSON
+            text_data = getattr(part0, "text", None)
+            if isinstance(text_data, str):
+                import json as _json
+                try:
+                    return _json.loads(text_data)
+                except Exception:
+                    pass  # not JSON; continue
 
-        # Fallback: try direct attribute
-        data = getattr(resp, "result", None)
-        if data is not None:
-            return data
+        # Last resort: try model_dump if it exists (pydantic-style)
+        dump_fn = getattr(payload, "model_dump", None)
+        if callable(dump_fn):
+            out = dump_fn()
+            if isinstance(out, dict):
+                return out
 
-        return content
+        # Give up, wrap as-is
+        return {"result": payload}
 
-    async def ask(self, question: str) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    async def get_search_results(self, question: str) -> Dict[str, float]:
         """
-        Query the MCP server for a question using both tools concurrently.
-
-        This runs:
-        - get_search_result(question): returns {file_path: score, ...}
-        - get_answer_rag(question): returns the structured RAG answer schema
+        Call the ``get_search_result`` MCP tool.
 
         Parameters
         ----------
@@ -142,96 +119,57 @@ class McpClient:
 
         Returns
         -------
-        (search_map, rag_result)
-            *search_map* is a mapping of file_path → relevance score.
-            *rag_result* is the RAG answer schema returned by the server.
+        Dict[str, float]
+            Mapping ``{file_path: relevance_score}``.
         """
-        search_coro = self._call_tool_json("get_search_result", {"question": question})
-        rag_coro = self._call_tool_json("get_answer_rag", {"question": question})
+        assert self.session is not None
+        result = await self.session.call_tool("get_search_result", arguments={"question": question})
+        data = self._as_json_dict(result)
+        return {str(k): float(v) for k, v in data.items()}
 
-        search_result_raw, rag_result_raw = await asyncio.gather(search_coro, rag_coro)
+    async def get_answer_rag(self, question: str) -> Dict[str, Any]:
+        """
+        Call the ``get_answer_rag`` MCP tool.
 
-        # Normalize search map
-        if isinstance(search_result_raw, dict):
-            search_map: Dict[str, float] = {str(k): float(v) for k, v in search_result_raw.items()}
-        else:
-            logger.warning("Unexpected search result shape: %r", type(search_result_raw))
-            search_map = {}
+        Parameters
+        ----------
+        question:
+            Natural-language question.
 
-        # RAG result should be a dict with known keys; if not, pass through raw
-        rag_result: Dict[str, Any]
-        if isinstance(rag_result_raw, dict):
-            rag_result = rag_result_raw
-        else:
-            logger.warning("Unexpected RAG result shape: %r", type(rag_result_raw))
-            rag_result = {"raw": rag_result_raw}
-
-        return search_map, rag_result
+        Returns
+        -------
+        Dict[str, Any]
+            RAG answer payload as returned by the server.
+        """
+        assert self.session is not None
+        result = await self.session.call_tool("get_answer_rag", arguments={"question": question})
+        return self._as_json_dict(result)
 
 
-async def async_main(question: Optional[str] = None) -> None:
+async def async_main() -> None:
     """
     Main entry point for MCP client.
-
-    Parameters
-    ----------
-    question:
-        Optional question to ask. If None, read from stdin.
     """
-    if not question:
-        try:
-            question = input("🧠 Ask Archive Agent… ").strip()
-        except EOFError:
-            question = None
-
-    if not question:
-        logger.error("No question provided.")
-        return
-
     client = McpClient()
     try:
         await client.connect_to_sse_server()
 
-        search_map, rag = await client.ask(question)
+        question: str = "Which files mention donuts?"
 
-        # Pretty print summary
-        logger.info("Top relevant files:")
-        for path, score in sorted(search_map.items(), key=lambda kv: kv[1], reverse=True)[:10]:
-            logger.info("  %.4f  %s", score, path)
+        # Search results
+        search_map: Dict[str, float] = await client.get_search_results(question)
+        print_json(data={"search_results": search_map})
 
-        if isinstance(rag, dict):
-            logger.info("Answer (rephrased): %s", rag.get("question_rephrased"))
-            logger.info("Conclusion: %s", rag.get("answer_conclusion"))
-
-            answers = rag.get("answer_list") or []
-            if isinstance(answers, list):
-                for i, item in enumerate(answers, 1):
-                    ans = item.get("answer")
-                    refs = item.get("chunk_ref_list")
-                    logger.info("— Part %d:", i)
-                    if isinstance(ans, str):
-                        logger.info("  %s", ans)
-                    if isinstance(refs, list):
-                        logger.info("  refs: %s", refs)
-
-            rejected = rag.get("is_rejected")
-            if rejected:
-                logger.warning("RAG rejected: %s", rag.get("rejection_reason"))
-
-        else:
-            logger.info("RAG (raw): %r", rag)
+        # Full RAG answer
+        rag_answer: Dict[str, Any] = await client.get_answer_rag(question)
+        print_json(data={"answer_rag": rag_answer})
 
     finally:
         await client.cleanup()
 
 
 def main() -> None:
-    """
-    Synchronous entry point.
-    """
-    import sys
-    q: Optional[str] = sys.argv[1] if len(sys.argv) > 1 else None
-    asyncio.run(async_main(q))
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
